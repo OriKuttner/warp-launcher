@@ -1,0 +1,128 @@
+<header class="app-header">
+  <div class="header-content">
+    <div class="logo-area">
+      <div class="logo-icon">🚀</div>
+      <div>
+        <h1>Warp Launcher</h1>
+        <p class="subtitle">Run your PWAs as native, isolated desktop applications</p>
+      </div>
+    </div>
+    <button type="button" class="btn btn-primary" (click)="openCreateModal()">
+      + New Application
+    </button>
+  </div>
+</header>
+
+<main class="main-container">
+  @if (message()) {
+    <div class="toast-message" role="status">
+      {{ message() }}
+    </div>
+  }
+
+  @if (isLoading()) {
+    <div class="state-container">
+      <div class="spinner"></div>
+      <p>Loading applications...</p>
+    </div>
+  } @else if (apps().length === 0) {
+    <div class="state-container empty-state">
+      <div class="empty-icon">🪐</div>
+      <h2>No applications configured yet</h2>
+      <p>Add your first PWA to run it in its own isolated environment with dedicated storage.</p>
+      <button type="button" class="btn btn-primary mt-4" (click)="openCreateModal()">
+        + Add Application
+      </button>
+    </div>
+  } @else {
+    <div class="apps-grid">
+      @for (app of apps(); track app.id) {
+        <article class="app-card" (click)="launchApp(app)">
+          <div class="card-icon">
+            @if (app.icon) {
+              <img [src]="app.icon" [alt]="app.name" (error)="app.icon = undefined" />
+            } @else {
+              <div class="fallback-icon">{{ app.name.charAt(0).toUpperCase() }}</div>
+            }
+          </div>
+          <div class="card-details">
+            <h3>{{ app.name }}</h3>
+            <p class="app-url">{{ app.url }}</p>
+            <span class="profile-tag">Profile: {{ app.id }}</span>
+          </div>
+          <footer class="card-actions">
+            <button type="button" class="btn btn-sm btn-secondary" title="Create desktop shortcut" (click)="createShortcut(app, $event)">
+              📌 Shortcut
+            </button>
+            <button type="button" class="btn btn-sm btn-secondary" title="Edit" (click)="openEditModal(app, $event)">
+              ✏️
+            </button>
+            <button type="button" class="btn btn-sm btn-danger" title="Delete" (click)="deleteApp(app, $event)">
+              🗑️
+            </button>
+          </footer>
+        </article>
+      }
+    </div>
+  }
+</main>
+
+<!-- Dialog for Adding / Editing Apps -->
+<dialog #appDialog class="app-dialog" aria-labelledby="dialog-title">
+  <div class="dialog-content">
+    <h2 id="dialog-title">{{ isEditing ? 'Edit Application' : 'Add New Application' }}</h2>
+    <form (ngSubmit)="saveApp()">
+      <div class="form-group">
+        <label for="appUrl">Application URL (PWA)</label>
+        <input 
+          type="url" 
+          id="appUrl" 
+          name="appUrl" 
+          required 
+          [(ngModel)]="appUrl" 
+          (ngModelChange)="onUrlChange()"
+          autocorrect="off" 
+          autocapitalize="off" 
+          spellcheck="false"
+        />
+      </div>
+
+      <div class="form-group">
+        <label for="appName">Display Name</label>
+        <input 
+          type="text" 
+          id="appName" 
+          name="appName" 
+          required 
+          [(ngModel)]="appName" 
+        />
+      </div>
+
+      <div class="form-group">
+        <label for="folderId">Folder / Profile Name (Letters, numbers, dashes)</label>
+        <input 
+          type="text" 
+          id="folderId" 
+          name="folderId" 
+          required 
+          pattern="[a-zA-Z0-9-_]+"
+          [disabled]="isEditing"
+          [(ngModel)]="folderId" 
+          autocorrect="off" 
+          autocapitalize="off" 
+          spellcheck="false"
+        />
+        <span class="field-hint">Defines the isolated storage folder: ~/.local/share/warp/profiles/{{ folderId || 'name' }}</span>
+      </div>
+
+      <div class="dialog-actions">
+        <button type="button" class="btn btn-secondary" (click)="closeModal()" [disabled]="isSubmitting()">
+          Cancel
+        </button>
+        <button type="submit" class="btn btn-primary" [disabled]="isSubmitting()">
+          {{ isSubmitting() ? 'Saving...' : (isEditing ? 'Save Changes' : 'Create & Launch') }}
+        </button>
+      </div>
+    </form>
+  </div>
+</dialog>
