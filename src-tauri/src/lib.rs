@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::PathBuf;
-use tauri::{AppHandle, Manager, WebviewUrl, WebviewWindowBuilder};
+use tauri::{webview::NewWindowResponse, AppHandle, Manager, WebviewUrl, WebviewWindowBuilder};
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct PwaApp {
@@ -255,6 +255,44 @@ fn create_desktop_shortcut(id: String) -> Result<String, String> {
     Ok(desktop_file_path.to_string_lossy().to_string())
 }
 
+fn open_in_default_browser(url: &str) {
+    #[cfg(target_os = "linux")]
+    {
+        let _ = std::process::Command::new("xdg-open").arg(url).spawn();
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let _ = std::process::Command::new("open").arg(url).spawn();
+    }
+    #[cfg(target_os = "windows")]
+    {
+        let _ = std::process::Command::new("cmd").args(["/C", "start", "", url]).spawn();
+    }
+}
+
+fn is_internal_url(target_url: &url::Url, base_host: Option<&str>) -> bool {
+    let scheme = target_url.scheme();
+    if scheme != "http" && scheme != "https" {
+        return true;
+    }
+    if let Some(base) = base_host {
+        if let Some(target_host) = target_url.host_str() {
+            let target_host = target_host.to_lowercase();
+            if target_host == base || target_host.ends_with(&format!(".{}", base)) {
+                return true;
+            }
+            if let Some(dot_idx) = base.find('.') {
+                let root_domain = &base[dot_idx + 1..];
+                if root_domain.contains('.') && (target_host == root_domain || target_host.ends_with(&format!(".{}", root_domain))) {
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
+    true
+}
+
 pub fn open_pwa_window(app_handle: &AppHandle, app: &PwaApp) -> Result<(), String> {
     let window_label = format!("pwa-{}", app.id);
 
@@ -265,7 +303,7 @@ pub fn open_pwa_window(app_handle: &AppHandle, app: &PwaApp) -> Result<(), Strin
         return Ok(());
     }
 
-    let parsed_url = app.url.parse().map_err(|e: url::ParseError| e.to_string())?;
+    let parsed_url: url::Url = app.url.parse().map_err(|e: url::ParseError| e.to_string())?;
     let warp_dir = get_warp_dir()?;
     let profile_dir = warp_dir.join("profiles").join(&app.id);
     if !profile_dir.exists() {
@@ -274,9 +312,149 @@ pub fn open_pwa_window(app_handle: &AppHandle, app: &PwaApp) -> Result<(), Strin
 
     let shortcut_script = r#"
     (function() {
+      // 1. Mock PWA Standalone environment for all web applications
+      try {
+        Object.defineProperty(Navigator.prototype, 'standalone', {
+          get: function() { return true; },
+          configurable: true,
+          enumerable: true
+        });
+      } catch (e) {}
+
+      try {
+        Object.defineProperty(navigator, 'standalone', {
+          get: function() { return true; },
+          configurable: true,
+          enumerable: true
+        });
+      } catch (e) {}
+
+      window.__WARP_LAUNCHER__ = true;
+
+      try {
+        localStorage.setItem('isInstalled', 'true');
+      } catch (e) {}
+
+      try {
+        const origMatchMedia = window.matchMedia;
+        const mockMatchMedia = function(query) {
+          const q = (typeof query === 'string') ? query.toLowerCase() : '';
+          if (q.includes('display-mode: standalone') || 
+              q.includes('display-mode:standalone') ||
+              q.includes('display-mode: minimal-ui') ||
+              q.includes('display-mode: fullscreen')) {
+            return {
+              matches: true,
+              media: query,
+              onchange: null,
+              addListener: function() {},
+              removeListener: function() {},
+              addEventListener: function() {},
+              removeEventListener: function() {},
+              dispatchEvent: function() { return false; }
+            };
+          }
+          return origMatchMedia ? origMatchMedia.call(window, query) : { matches: false, media: query };
+        };
+
+        try {
+          Object.defineProperty(Window.prototype, 'matchMedia', {
+            value: mockMatchMedia,
+            writable: true,
+            configurable: true
+          });
+        } catch (e) {}
+
+        window.matchMedia = mockMatchMedia;
+      } catch (e) {}
+
+      // 2. Restore saved zoom level
       let currentZoom = parseFloat(localStorage.getItem('__warp_zoom') || '1.0');
       if (currentZoom !== 1.0) {
         document.documentElement.style.zoom = currentZoom;
+      }
+
+      // 3. Floating URL Navigation Dialog (Ctrl + L or F6)
+      function showUrlDialog() {
+        if (document.getElementById('__warp_url_dialog')) {
+          const existingInp = document.getElementById('__warp_url_input');
+          if (existingInp) { existingInp.focus(); existingInp.select(); }
+          return;
+        }
+
+        const overlay = document.createElement('div');
+        overlay.id = '__warp_url_dialog';
+        overlay.style.cssText = 'position:fixed;top:0;left:0;width:100vw;height:100vh;background:rgba(0,0,0,0.65);z-index:2147483647;display:flex;align-items:center;justify-content:center;font-family:-apple-system,BlinkMacSystemFont,Segoe UI,Roboto,sans-serif;';
+
+        const box = document.createElement('div');
+        box.style.cssText = 'background:#1e293b;color:#f8fafc;padding:24px;border-radius:12px;box-shadow:0 20px 25px -5px rgba(0,0,0,0.5);width:90%;max-width:540px;border:1px solid #334155;';
+
+        const label = document.createElement('label');
+        label.htmlFor = '__warp_url_input';
+        label.innerText = 'Navigate to URL or Login Link:';
+        label.style.cssText = 'display:block;margin-bottom:8px;font-size:14px;font-weight:600;color:#e2e8f0;';
+
+        const input = document.createElement('input');
+        input.id = '__warp_url_input';
+        input.type = 'text';
+        input.value = window.location.href;
+        input.style.cssText = 'width:100%;box-sizing:border-box;padding:10px 14px;border:1px solid #475569;border-radius:8px;background:#0f172a;color:#f8fafc;font-size:14px;outline:none;';
+
+        const btnRow = document.createElement('div');
+        btnRow.style.cssText = 'display:flex;justify-content:flex-end;gap:10px;margin-top:16px;';
+
+        const cancelBtn = document.createElement('button');
+        cancelBtn.type = 'button';
+        cancelBtn.innerText = 'Cancel';
+        cancelBtn.style.cssText = 'padding:8px 16px;border-radius:6px;border:1px solid #475569;background:transparent;color:#94a3b8;cursor:pointer;font-size:13px;font-weight:500;';
+
+        const goBtn = document.createElement('button');
+        goBtn.type = 'button';
+        goBtn.innerText = 'Go';
+        goBtn.style.cssText = 'padding:8px 20px;border-radius:6px;border:none;background:#3b82f6;color:#ffffff;cursor:pointer;font-size:13px;font-weight:600;';
+
+        function close() {
+          if (overlay.parentNode) overlay.parentNode.removeChild(overlay);
+        }
+
+        function navigate() {
+          let val = input.value.trim();
+          if (val) {
+            if (!val.startsWith('http://') && !val.startsWith('https://')) {
+              val = 'https://' + val;
+            }
+            close();
+            window.location.href = val;
+          }
+        }
+
+        cancelBtn.onclick = close;
+        goBtn.onclick = navigate;
+
+        input.onkeydown = function(ev) {
+          if (ev.key === 'Enter') {
+            ev.preventDefault();
+            navigate();
+          } else if (ev.key === 'Escape') {
+            ev.preventDefault();
+            close();
+          }
+        };
+
+        overlay.onclick = function(ev) {
+          if (ev.target === overlay) close();
+        };
+
+        btnRow.appendChild(cancelBtn);
+        btnRow.appendChild(goBtn);
+        box.appendChild(label);
+        box.appendChild(input);
+        box.appendChild(btnRow);
+        overlay.appendChild(box);
+        document.body.appendChild(overlay);
+
+        input.focus();
+        input.select();
       }
 
       window.addEventListener('keydown', function(e) {
@@ -284,6 +462,13 @@ pub fn open_pwa_window(app_handle: &AppHandle, app: &PwaApp) -> Result<(), Strin
         if (e.key === 'F5' || ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'r')) {
           e.preventDefault();
           window.location.reload();
+          return;
+        }
+
+        // Ctrl + L or F6 : Open URL dialog
+        if (((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'l') || e.key === 'F6') {
+          e.preventDefault();
+          showUrlDialog();
           return;
         }
 
@@ -331,6 +516,10 @@ pub fn open_pwa_window(app_handle: &AppHandle, app: &PwaApp) -> Result<(), Strin
     })();
     "#;
 
+    let base_host = parsed_url.host_str().map(|h| h.to_lowercase());
+    let nav_base_host = base_host.clone();
+    let new_win_base_host = base_host.clone();
+
     let builder = WebviewWindowBuilder::new(
         app_handle,
         &window_label,
@@ -339,7 +528,22 @@ pub fn open_pwa_window(app_handle: &AppHandle, app: &PwaApp) -> Result<(), Strin
     .title(&app.name)
     .inner_size(1200.0, 800.0)
     .data_directory(profile_dir)
-    .initialization_script(shortcut_script);
+    .initialization_script(shortcut_script)
+    .on_navigation(move |nav_url| {
+        if !is_internal_url(nav_url, nav_base_host.as_deref()) {
+            open_in_default_browser(nav_url.as_str());
+            return false;
+        }
+        true
+    })
+    .on_new_window(move |new_url, _features| {
+        if !is_internal_url(&new_url, new_win_base_host.as_deref()) {
+            open_in_default_browser(new_url.as_str());
+            NewWindowResponse::Deny
+        } else {
+            NewWindowResponse::Allow
+        }
+    });
 
     builder.build().map_err(|e| e.to_string())?;
     Ok(())

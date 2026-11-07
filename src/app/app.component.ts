@@ -47,8 +47,13 @@ export class AppComponent implements OnInit {
     }
   }
 
+  isManualName = false;
+  isManualFolder = false;
+
   openCreateModal(): void {
     this.isEditing = false;
+    this.isManualName = false;
+    this.isManualFolder = false;
     this.appName = '';
     this.appUrl = '';
     this.folderId = '';
@@ -58,6 +63,8 @@ export class AppComponent implements OnInit {
   openEditModal(app: PwaApp, event: Event): void {
     event.stopPropagation();
     this.isEditing = true;
+    this.isManualName = true;
+    this.isManualFolder = true;
     this.appName = app.name;
     this.appUrl = app.url;
     this.folderId = app.id;
@@ -68,18 +75,49 @@ export class AppComponent implements OnInit {
     this.appDialog.nativeElement.close();
   }
 
+  onNameManualInput(): void {
+    this.isManualName = true;
+  }
+
+  onFolderManualInput(): void {
+    this.isManualFolder = true;
+  }
+
   onUrlChange(): void {
-    if (!this.isEditing && !this.folderId) {
-      try {
-        const u = new URL(this.appUrl);
-        const host = u.hostname.replace('www.', '').split('.')[0];
-        this.folderId = host.toLowerCase().replace(/[^a-z0-9-]/g, '-');
-        if (!this.appName) {
-          this.appName = host.charAt(0).toUpperCase() + host.slice(1);
+    if (this.isEditing) {
+      return;
+    }
+
+    let raw = (this.appUrl || '').trim();
+    if (!raw) {
+      if (!this.isManualFolder) this.folderId = '';
+      if (!this.isManualName) this.appName = '';
+      return;
+    }
+
+    if (!raw.startsWith('http://') && !raw.startsWith('https://')) {
+      raw = 'https://' + raw;
+    }
+
+    try {
+      const u = new URL(raw);
+      const hostname = u.hostname.replace(/^www\./, '');
+      const parts = hostname.split('.');
+      const firstPart = parts[0];
+
+      if (firstPart) {
+        const cleanId = firstPart.toLowerCase().replace(/[^a-z0-9-]/g, '-');
+        const cleanName = firstPart.charAt(0).toUpperCase() + firstPart.slice(1);
+
+        if (!this.isManualFolder) {
+          this.folderId = cleanId;
         }
-      } catch {
-        // Not a valid URL yet, skip
+        if (!this.isManualName) {
+          this.appName = cleanName;
+        }
       }
+    } catch {
+      // Not a valid URL yet, skip
     }
   }
 
