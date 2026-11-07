@@ -374,7 +374,130 @@ pub fn open_pwa_window(app_handle: &AppHandle, app: &PwaApp) -> Result<(), Strin
         document.documentElement.style.zoom = currentZoom;
       }
 
-      // 3. Floating URL Navigation Dialog (Ctrl + L or F6)
+      // 3. Window Title Customization (Persistent)
+      let customTitle = localStorage.getItem('__warp_custom_title') || '';
+      let currentTitleVal = document.title;
+
+      try {
+        const titleDescriptor = Object.getOwnPropertyDescriptor(Document.prototype, 'title') ||
+                                Object.getOwnPropertyDescriptor(HTMLDocument.prototype, 'title');
+
+        if (titleDescriptor && titleDescriptor.set) {
+          const origTitleSet = titleDescriptor.set;
+          const origTitleGet = titleDescriptor.get;
+
+          Object.defineProperty(document, 'title', {
+            get: function() {
+              return customTitle || (origTitleGet ? origTitleGet.call(this) : currentTitleVal);
+            },
+            set: function(val) {
+              currentTitleVal = val;
+              if (customTitle) {
+                if (origTitleSet) origTitleSet.call(this, customTitle);
+              } else {
+                if (origTitleSet) origTitleSet.call(this, val);
+              }
+            },
+            configurable: true
+          });
+        }
+      } catch (e) {}
+
+      if (customTitle) {
+        document.title = customTitle;
+      }
+
+      function showTitleDialog() {
+        if (document.getElementById('__warp_title_dialog')) {
+          const existingInp = document.getElementById('__warp_title_input');
+          if (existingInp) { existingInp.focus(); existingInp.select(); }
+          return;
+        }
+
+        const overlay = document.createElement('div');
+        overlay.id = '__warp_title_dialog';
+        overlay.style.cssText = 'position:fixed;top:0;left:0;width:100vw;height:100vh;background:rgba(0,0,0,0.65);z-index:2147483647;display:flex;align-items:center;justify-content:center;font-family:-apple-system,BlinkMacSystemFont,Segoe UI,Roboto,sans-serif;';
+
+        const box = document.createElement('div');
+        box.style.cssText = 'background:#1e293b;color:#f8fafc;padding:24px;border-radius:12px;box-shadow:0 20px 25px -5px rgba(0,0,0,0.5);width:90%;max-width:500px;border:1px solid #334155;';
+
+        const label = document.createElement('label');
+        label.htmlFor = '__warp_title_input';
+        label.innerText = 'Change Window Title:';
+        label.style.cssText = 'display:block;margin-bottom:8px;font-size:14px;font-weight:600;color:#e2e8f0;';
+
+        const input = document.createElement('input');
+        input.id = '__warp_title_input';
+        input.type = 'text';
+        input.value = customTitle || document.title || '';
+        input.style.cssText = 'width:100%;box-sizing:border-box;padding:10px 14px;border:1px solid #475569;border-radius:8px;background:#0f172a;color:#f8fafc;font-size:14px;outline:none;';
+
+        const hint = document.createElement('div');
+        hint.innerText = 'Leave empty to restore default website title';
+        hint.style.cssText = 'font-size:12px;color:#94a3b8;margin-top:6px;';
+
+        const btnRow = document.createElement('div');
+        btnRow.style.cssText = 'display:flex;justify-content:flex-end;gap:10px;margin-top:16px;';
+
+        const cancelBtn = document.createElement('button');
+        cancelBtn.type = 'button';
+        cancelBtn.innerText = 'Cancel';
+        cancelBtn.style.cssText = 'padding:8px 16px;border-radius:6px;border:1px solid #475569;background:transparent;color:#94a3b8;cursor:pointer;font-size:13px;font-weight:500;';
+
+        const saveBtn = document.createElement('button');
+        saveBtn.type = 'button';
+        saveBtn.innerText = 'Save';
+        saveBtn.style.cssText = 'padding:8px 20px;border-radius:6px;border:none;background:#3b82f6;color:#ffffff;cursor:pointer;font-size:13px;font-weight:600;';
+
+        function close() {
+          if (overlay.parentNode) overlay.parentNode.removeChild(overlay);
+        }
+
+        function save() {
+          const val = input.value.trim();
+          if (val) {
+            customTitle = val;
+            localStorage.setItem('__warp_custom_title', val);
+            document.title = val;
+          } else {
+            customTitle = '';
+            localStorage.removeItem('__warp_custom_title');
+            document.title = currentTitleVal || '';
+          }
+          close();
+        }
+
+        cancelBtn.onclick = close;
+        saveBtn.onclick = save;
+
+        input.onkeydown = function(ev) {
+          if (ev.key === 'Enter') {
+            ev.preventDefault();
+            save();
+          } else if (ev.key === 'Escape') {
+            ev.preventDefault();
+            close();
+          }
+        };
+
+        overlay.onclick = function(ev) {
+          if (ev.target === overlay) close();
+        };
+
+        btnRow.appendChild(cancelBtn);
+        btnRow.appendChild(saveBtn);
+        box.appendChild(label);
+        box.appendChild(input);
+        box.appendChild(hint);
+        box.appendChild(btnRow);
+        overlay.appendChild(box);
+        document.body.appendChild(overlay);
+
+        input.focus();
+        input.select();
+      }
+
+      // 4. Floating URL Navigation Dialog (Ctrl + L or F6)
       function showUrlDialog() {
         if (document.getElementById('__warp_url_dialog')) {
           const existingInp = document.getElementById('__warp_url_input');
@@ -465,6 +588,13 @@ pub fn open_pwa_window(app_handle: &AppHandle, app: &PwaApp) -> Result<(), Strin
           return;
         }
 
+        // F2 or Alt + T : Open Change Window Title dialog
+        if (e.key === 'F2' || (e.altKey && e.key.toLowerCase() === 't')) {
+          e.preventDefault();
+          showTitleDialog();
+          return;
+        }
+
         // Ctrl + L or F6 : Open URL dialog
         if (((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'l') || e.key === 'F6') {
           e.preventDefault();
@@ -529,6 +659,9 @@ pub fn open_pwa_window(app_handle: &AppHandle, app: &PwaApp) -> Result<(), Strin
     .inner_size(1200.0, 800.0)
     .data_directory(profile_dir)
     .initialization_script(shortcut_script)
+    .on_document_title_changed(|window, title| {
+        let _ = window.set_title(&title);
+    })
     .on_navigation(move |nav_url| {
         if !is_internal_url(nav_url, nav_base_host.as_deref()) {
             open_in_default_browser(nav_url.as_str());
