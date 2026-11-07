@@ -36,6 +36,16 @@
     ],
     "android": {
       "debugApplicationIdSuffix": ".debug"
+    },
+    "shortDescription": "Warp Launcher",
+    "linux": {
+      "deb": {
+        "section": "admin",
+        "desktopTemplate": "desktop.template"
+      },
+      "rpm": {
+        "desktopTemplate": "desktop.template"
+      }
     }
   }
 }
