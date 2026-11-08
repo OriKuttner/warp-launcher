@@ -37,7 +37,18 @@
   } @else {
     <div class="apps-grid">
       @for (app of apps(); track app.id) {
-        <article class="app-card" (click)="launchApp(app)">
+        <article 
+          class="app-card" 
+          [class.is-dragging]="draggedAppId === app.id"
+          [class.drop-target]="dragOverAppId === app.id"
+          draggable="true"
+          (dragstart)="onDragStart($event, app)"
+          (dragover)="onDragOver($event, app)"
+          (dragleave)="onDragLeave($event, app)"
+          (drop)="onDrop($event, app)"
+          (dragend)="onDragEnd()"
+          (click)="launchApp(app)">
+          <div class="drag-handle" title="Drag to reorder" aria-hidden="true">⋮⋮</div>
           <div class="card-icon">
             @if (app.icon) {
               <img [src]="app.icon" [alt]="app.name" (error)="app.icon = undefined" />
@@ -50,7 +61,7 @@
             <p class="app-url">{{ app.url }}</p>
             <span class="profile-tag">Profile: {{ app.id }}</span>
           </div>
-          <footer class="card-actions">
+          <footer class="card-actions" (click)="$event.stopPropagation()">
             <button type="button" class="btn btn-sm btn-secondary" title="Create desktop shortcut" (click)="createShortcut(app, $event)">
               📌 Shortcut
             </button>
@@ -71,6 +82,13 @@
 <dialog #appDialog class="app-dialog" aria-labelledby="dialog-title">
   <div class="dialog-content">
     <h2 id="dialog-title">{{ isEditing ? 'Edit Application' : 'Add New Application' }}</h2>
+
+    @if (dialogError()) {
+      <div class="form-error-banner" role="alert">
+        {{ dialogError() }}
+      </div>
+    }
+
     <form (ngSubmit)="saveApp()">
       <div class="form-group">
         <label for="appUrl">Application URL (PWA)</label>
@@ -107,21 +125,30 @@
           name="folderId" 
           required 
           pattern="[a-zA-Z0-9-_]+"
-          [disabled]="isEditing"
+          [class.has-error]="isFolderDuplicate()"
           [(ngModel)]="folderId" 
           (input)="onFolderManualInput()"
           autocorrect="off" 
           autocapitalize="off" 
           spellcheck="false"
         />
-        <span class="field-hint">Defines the isolated storage folder: ~/.local/share/warp/profiles/{{ folderId || 'name' }}</span>
+        <span class="field-hint">
+          @if (isEditing && folderId && folderId !== originalFolderId) {
+            Will rename folder and move data: ~/.local/share/warp/profiles/{{ originalFolderId }} ➜ ~/.local/share/warp/profiles/{{ folderId }}
+          } @else {
+            Defines the isolated storage folder: ~/.local/share/warp/profiles/{{ folderId || 'name' }}
+          }
+        </span>
+        @if (isFolderDuplicate()) {
+          <span class="field-error" role="alert">A directory with this name already exists. Please choose a different directory name.</span>
+        }
       </div>
 
       <div class="dialog-actions">
         <button type="button" class="btn btn-secondary" (click)="closeModal()" [disabled]="isSubmitting()">
           Cancel
         </button>
-        <button type="submit" class="btn btn-primary" [disabled]="isSubmitting()">
+        <button type="submit" class="btn btn-primary" [disabled]="isSubmitting() || isFolderDuplicate()">
           {{ isSubmitting() ? 'Saving...' : (isEditing ? 'Save Changes' : 'Create & Launch') }}
         </button>
       </div>

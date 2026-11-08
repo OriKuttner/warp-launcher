@@ -165,61 +165,7 @@ fn get_apps() -> Result<Vec<PwaApp>, String> {
     Ok(apps)
 }
 
-#[tauri::command]
-fn save_app(name: String, url: String, folder_id: String) -> Result<PwaApp, String> {
-    let id = sanitize_id(&folder_id);
-    let mut apps = read_apps()?;
-
-    // Check if updating or adding
-    let icon_path = fetch_favicon(&url, &id);
-
-    let mut app = PwaApp {
-        id: id.clone(),
-        name: name.trim().to_string(),
-        url: url.trim().to_string(),
-        icon: icon_path,
-    };
-
-    if let Some(existing) = apps.iter_mut().find(|a| a.id == id) {
-        existing.name = app.name.clone();
-        existing.url = app.url.clone();
-        if app.icon.is_some() {
-            existing.icon = app.icon.clone();
-        }
-    } else {
-        apps.push(app.clone());
-    }
-
-    write_apps(&apps)?;
-
-    // Return data url to frontend
-    if let Some(ref path) = app.icon {
-        app.icon = icon_to_data_url(path).or_else(|| app.icon.clone());
-    }
-    Ok(app)
-}
-
-#[tauri::command]
-fn delete_app(id: String) -> Result<(), String> {
-    let mut apps = read_apps()?;
-    apps.retain(|a| a.id != id);
-    write_apps(&apps)?;
-    Ok(())
-}
-
-#[tauri::command]
-fn launch_app(app_handle: AppHandle, id: String) -> Result<(), String> {
-    let apps = read_apps()?;
-    let app = apps.into_iter().find(|a| a.id == id).ok_or_else(|| "App not found".to_string())?;
-
-    open_pwa_window(&app_handle, &app)
-}
-
-#[tauri::command]
-fn create_desktop_shortcut(id: String) -> Result<String, String> {
-    let apps = read_apps()?;
-    let app = apps.into_iter().find(|a| a.id == id).ok_or_else(|| "App not found".to_string())?;
-
+fn write_desktop_shortcut(app: &PwaApp) -> Result<String, String> {
     let data_dir = dirs::data_dir().ok_or_else(|| "Could not find data directory".to_string())?;
     let applications_dir = data_dir.join("applications");
     if !applications_dir.exists() {
@@ -253,6 +199,188 @@ fn create_desktop_shortcut(id: String) -> Result<String, String> {
 
     fs::write(&desktop_file_path, desktop_content).map_err(|e| e.to_string())?;
     Ok(desktop_file_path.to_string_lossy().to_string())
+}
+
+#[tauri::command]
+fn save_app(
+    name: String,
+    url: String,
+    folder_id: String,
+    is_edit: Option<bool>,
+    old_folder_id: Option<String>,
+) -> Result<PwaApp, String> {
+    let id = sanitize_id(&folder_id);
+    let mut apps = read_apps()?;
+    let is_editing = is_edit.unwrap_or(false);
+
+    let warp_dir = get_warp_dir()?;
+    let profiles_dir = warp_dir.join("profiles");
+    let icons_dir = warp_dir.join("icons");
+
+    let existing_idx = if is_editing {
+        let lookup_id = old_folder_id
+            .as_deref()
+            .map(sanitize_id)
+            .unwrap_or_else(|| id.clone());
+        apps.iter().position(|a| a.id == lookup_id)
+    } else {
+        apps.iter().position(|a| a.id == id)
+    };
+
+    if !is_editing && existing_idx.is_some() {
+        return Err(format!(
+            "A profile directory with the name '{}' already exists. Please choose a different directory name.",
+            id
+        ));
+    }
+
+    if is_editing && existing_idx.is_none() {
+        return Err("Application profile was not found to update.".to_string());
+    }
+
+    // If editing and folder_id has changed, migrate profile folder, icon and shortcut
+    if is_editing {
+        if let Some(idx) = existing_idx {
+            let old_id = apps[idx].id.clone();
+            if old_id != id {
+                // Ensure new id is not already used by another app
+                if apps.iter().any(|a| a.id == id) {
+                    return Err(format!(
+                        "A profile directory with the name '{}' already exists. Please choose a different directory name.",
+                        id
+                    ));
+                }
+
+                // Migrate profile folder on disk
+                let old_profile_dir = profiles_dir.join(&old_id);
+                let new_profile_dir = profiles_dir.join(&id);
+
+                if old_profile_dir.exists() {
+                    if new_profile_dir.exists() {
+                        return Err(format!(
+                            "Directory '{}' already exists on disk. Please choose another directory name.",
+                            id
+                        ));
+                    }
+                    fs::rename(&old_profile_dir, &new_profile_dir).map_err(|e| {
+                        format!("Failed to move profile data from '{}' to '{}': {}", old_id, id, e)
+                    })?;
+                }
+
+                // Migrate icon file if present
+                let old_icon_path = icons_dir.join(format!("{}.png", old_id));
+                let new_icon_path = icons_dir.join(format!("{}.png", id));
+                if old_icon_path.exists() && !new_icon_path.exists() {
+                    let _ = fs::rename(&old_icon_path, &new_icon_path);
+                }
+
+                // If desktop shortcut exists, migrate it
+                if let Some(data_dir) = dirs::data_dir() {
+                    let applications_dir = data_dir.join("applications");
+                    let old_desktop = applications_dir.join(format!("warp-{}.desktop", old_id));
+                    if old_desktop.exists() {
+                        let _ = fs::remove_file(old_desktop);
+                        let updated_app = PwaApp {
+                            id: id.clone(),
+                            name: name.trim().to_string(),
+                            url: url.trim().to_string(),
+                            icon: if new_icon_path.exists() {
+                                Some(new_icon_path.to_string_lossy().to_string())
+                            } else {
+                                apps[idx].icon.clone()
+                            },
+                        };
+                        let _ = write_desktop_shortcut(&updated_app);
+                    }
+                }
+            }
+        }
+    }
+
+    // Check if updating or adding
+    let icon_path = fetch_favicon(&url, &id);
+
+    let mut app = PwaApp {
+        id: id.clone(),
+        name: name.trim().to_string(),
+        url: url.trim().to_string(),
+        icon: icon_path,
+    };
+
+    if let Some(idx) = existing_idx {
+        apps[idx].id = app.id.clone();
+        apps[idx].name = app.name.clone();
+        apps[idx].url = app.url.clone();
+        if app.icon.is_some() {
+            apps[idx].icon = app.icon.clone();
+        } else {
+            // Keep existing icon if new fetch didn't return one, updating path if id changed
+            if let Some(ref _old_icon) = apps[idx].icon {
+                let new_icon_str = format!("{}.png", id);
+                let new_icon_path = icons_dir.join(&new_icon_str);
+                if new_icon_path.exists() {
+                    apps[idx].icon = Some(new_icon_path.to_string_lossy().to_string());
+                }
+            }
+            app.icon = apps[idx].icon.clone();
+        }
+    } else {
+        apps.push(app.clone());
+    }
+
+    write_apps(&apps)?;
+
+    // Return data url to frontend
+    if let Some(ref path) = app.icon {
+        app.icon = icon_to_data_url(path).or_else(|| app.icon.clone());
+    }
+    Ok(app)
+}
+
+#[tauri::command]
+fn delete_app(id: String) -> Result<(), String> {
+    let mut apps = read_apps()?;
+    apps.retain(|a| a.id != id);
+    write_apps(&apps)?;
+    Ok(())
+}
+
+#[tauri::command]
+fn reorder_apps(app_ids: Vec<String>) -> Result<(), String> {
+    let current_apps = read_apps()?;
+    let mut reordered: Vec<PwaApp> = Vec::new();
+
+    for id in &app_ids {
+        if let Some(app) = current_apps.iter().find(|a| &a.id == id) {
+            reordered.push(app.clone());
+        }
+    }
+
+    // Keep any apps that weren't in the provided list
+    for app in current_apps {
+        if !reordered.iter().any(|a| a.id == app.id) {
+            reordered.push(app);
+        }
+    }
+
+    write_apps(&reordered)?;
+    Ok(())
+}
+
+#[tauri::command]
+fn launch_app(app_handle: AppHandle, id: String) -> Result<(), String> {
+    let apps = read_apps()?;
+    let app = apps.into_iter().find(|a| a.id == id).ok_or_else(|| "App not found".to_string())?;
+
+    open_pwa_window(&app_handle, &app)
+}
+
+#[tauri::command]
+fn create_desktop_shortcut(id: String) -> Result<String, String> {
+    let apps = read_apps()?;
+    let app = apps.into_iter().find(|a| a.id == id).ok_or_else(|| "App not found".to_string())?;
+
+    write_desktop_shortcut(&app)
 }
 
 fn open_in_default_browser(url: &str) {
@@ -725,7 +853,8 @@ pub fn run() {
             save_app,
             delete_app,
             launch_app,
-            create_desktop_shortcut
+            create_desktop_shortcut,
+            reorder_apps
         ])
         .run(tauri::generate_context!())
         .expect("error while building tauri application");

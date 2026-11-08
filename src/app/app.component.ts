@@ -47,16 +47,35 @@ export class AppComponent implements OnInit {
     }
   }
 
+  dialogError = signal<string>('');
+
+  originalFolderId = '';
   isManualName = false;
   isManualFolder = false;
 
+  isFolderDuplicate(): boolean {
+    const clean = (this.folderId || '')
+      .trim()
+      .toLowerCase()
+      .replace(/[^a-z0-9-_]/g, '-');
+    if (!clean) {
+      return false;
+    }
+    if (this.isEditing && clean === this.originalFolderId.toLowerCase()) {
+      return false;
+    }
+    return this.apps().some(a => a.id.toLowerCase() === clean);
+  }
+
   openCreateModal(): void {
     this.isEditing = false;
+    this.originalFolderId = '';
     this.isManualName = false;
     this.isManualFolder = false;
     this.appName = '';
     this.appUrl = '';
     this.folderId = '';
+    this.dialogError.set('');
     this.appDialog.nativeElement.showModal();
   }
 
@@ -68,10 +87,13 @@ export class AppComponent implements OnInit {
     this.appName = app.name;
     this.appUrl = app.url;
     this.folderId = app.id;
+    this.originalFolderId = app.id;
+    this.dialogError.set('');
     this.appDialog.nativeElement.showModal();
   }
 
   closeModal(): void {
+    this.dialogError.set('');
     this.appDialog.nativeElement.close();
   }
 
@@ -81,6 +103,7 @@ export class AppComponent implements OnInit {
 
   onFolderManualInput(): void {
     this.isManualFolder = true;
+    this.dialogError.set('');
   }
 
   onUrlChange(): void {
@@ -106,14 +129,27 @@ export class AppComponent implements OnInit {
       const firstPart = parts[0];
 
       if (firstPart) {
-        const cleanId = firstPart.toLowerCase().replace(/[^a-z0-9-]/g, '-');
+        const cleanId = firstPart.toLowerCase().replace(/[^a-z0-9-_]/g, '-');
         const cleanName = firstPart.charAt(0).toUpperCase() + firstPart.slice(1);
 
         if (!this.isManualFolder) {
-          this.folderId = cleanId;
+          let candidateId = cleanId;
+          let counter = 2;
+          while (this.apps().some(a => a.id.toLowerCase() === candidateId.toLowerCase())) {
+            candidateId = `${cleanId}-${counter}`;
+            counter++;
+          }
+          this.folderId = candidateId;
         }
+
         if (!this.isManualName) {
-          this.appName = cleanName;
+          let candidateName = cleanName;
+          let counter = 2;
+          while (this.apps().some(a => a.name.toLowerCase() === candidateName.toLowerCase())) {
+            candidateName = `${cleanName} (${counter})`;
+            counter++;
+          }
+          this.appName = candidateName;
         }
       }
     } catch {
@@ -126,25 +162,104 @@ export class AppComponent implements OnInit {
       return;
     }
 
+    if (this.isFolderDuplicate()) {
+      this.dialogError.set('A profile directory with this name already exists. Please choose a different directory name.');
+      return;
+    }
+
     this.isSubmitting.set(true);
+    this.dialogError.set('');
     try {
       await invoke('save_app', {
         name: this.appName,
         url: this.appUrl,
-        folderId: this.folderId
+        folderId: this.folderId,
+        isEdit: this.isEditing,
+        oldFolderId: this.isEditing ? this.originalFolderId : null
       });
       this.closeModal();
       await this.loadApps();
       this.showTemporaryMessage(`Application "${this.appName}" saved successfully!`);
-    } catch (err) {
+    } catch (err: unknown) {
       console.error('Failed to save app:', err);
-      alert(`Error saving app: ${err}`);
+      const errMsg = typeof err === 'string' ? err : (err instanceof Error ? err.message : 'Failed to save application');
+      this.dialogError.set(errMsg);
     } finally {
       this.isSubmitting.set(false);
     }
   }
 
+  draggedAppId: string | null = null;
+  dragOverAppId: string | null = null;
+  private wasDragging = false;
+
+  onDragStart(event: DragEvent, app: PwaApp): void {
+    this.draggedAppId = app.id;
+    this.wasDragging = true;
+    if (event.dataTransfer) {
+      event.dataTransfer.effectAllowed = 'move';
+      event.dataTransfer.setData('text/plain', app.id);
+    }
+  }
+
+  onDragOver(event: DragEvent, app: PwaApp): void {
+    if (this.draggedAppId && this.draggedAppId !== app.id) {
+      event.preventDefault();
+      if (event.dataTransfer) {
+        event.dataTransfer.dropEffect = 'move';
+      }
+      this.dragOverAppId = app.id;
+    }
+  }
+
+  onDragLeave(event: DragEvent, app: PwaApp): void {
+    if (this.dragOverAppId === app.id) {
+      const related = event.relatedTarget as Node | null;
+      const currentTarget = event.currentTarget as Node | null;
+      if (!currentTarget || !related || !currentTarget.contains(related)) {
+        this.dragOverAppId = null;
+      }
+    }
+  }
+
+  async onDrop(event: DragEvent, targetApp: PwaApp): Promise<void> {
+    event.preventDefault();
+    const sourceId = this.draggedAppId;
+    this.dragOverAppId = null;
+    this.draggedAppId = null;
+
+    if (!sourceId || sourceId === targetApp.id) {
+      return;
+    }
+
+    const currentApps = [...this.apps()];
+    const fromIndex = currentApps.findIndex(a => a.id === sourceId);
+    const toIndex = currentApps.findIndex(a => a.id === targetApp.id);
+
+    if (fromIndex !== -1 && toIndex !== -1) {
+      const [moved] = currentApps.splice(fromIndex, 1);
+      currentApps.splice(toIndex, 0, moved);
+      this.apps.set(currentApps);
+      try {
+        await invoke('reorder_apps', { appIds: currentApps.map(a => a.id) });
+      } catch (err) {
+        console.error('Failed to save reordered apps:', err);
+      }
+    }
+  }
+
+  onDragEnd(): void {
+    this.draggedAppId = null;
+    this.dragOverAppId = null;
+    setTimeout(() => {
+      this.wasDragging = false;
+    }, 150);
+  }
+
   async launchApp(app: PwaApp): Promise<void> {
+    if (this.wasDragging) {
+      return;
+    }
     try {
       await invoke('launch_app', { id: app.id });
     } catch (err) {
