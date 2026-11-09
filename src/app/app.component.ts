@@ -8,6 +8,7 @@ export interface PwaApp {
   name: string;
   url: string;
   icon?: string;
+  notifications?: string;
 }
 
 @Component({
@@ -290,6 +291,57 @@ export class AppComponent implements OnInit {
         console.error('Failed to delete app:', err);
         alert(`Error deleting app: ${err}`);
       }
+    }
+  }
+
+  selectedAppForPerms = signal<PwaApp | null>(null);
+  @ViewChild('permissionsDialog') permissionsDialog!: ElementRef<HTMLDialogElement>;
+
+  getPermissionLabel(status?: string): string {
+    if (status === 'granted') {
+      return 'Allowed';
+    }
+    if (status === 'denied') {
+      return 'Blocked';
+    }
+    return 'Ask';
+  }
+
+  openPermissionsModal(app: PwaApp, event: Event): void {
+    event.stopPropagation();
+    this.selectedAppForPerms.set(app);
+    this.permissionsDialog.nativeElement.showModal();
+  }
+
+  closePermissionsModal(): void {
+    this.selectedAppForPerms.set(null);
+    this.permissionsDialog.nativeElement.close();
+  }
+
+  async setAppPermission(app: PwaApp, permission: string): Promise<void> {
+    try {
+      await invoke('set_app_notification_permission', { id: app.id, permission });
+      const permVal = permission === 'default' ? undefined : permission;
+      const currentList = this.apps().map(a => {
+        if (a.id === app.id) {
+          return {
+            ...a,
+            notifications: permVal
+          };
+        }
+        return a;
+      });
+      this.apps.set(currentList);
+      if (this.selectedAppForPerms()?.id === app.id) {
+        this.selectedAppForPerms.set({
+          ...app,
+          notifications: permVal
+        });
+      }
+      this.showTemporaryMessage(`Notification permission for "${app.name}" updated to ${this.getPermissionLabel(permVal)}.`);
+    } catch (err) {
+      console.error('Failed to update notification permission:', err);
+      alert(`Error updating notification permission: ${err}`);
     }
   }
 

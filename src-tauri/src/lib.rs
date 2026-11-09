@@ -9,6 +9,8 @@ pub struct PwaApp {
     pub name: String,
     pub url: String,
     pub icon: Option<String>,
+    #[serde(default)]
+    pub notifications: Option<String>,
 }
 
 fn get_warp_dir() -> Result<PathBuf, String> {
@@ -289,6 +291,7 @@ fn save_app(
                             } else {
                                 apps[idx].icon.clone()
                             },
+                            notifications: apps[idx].notifications.clone(),
                         };
                         let _ = write_desktop_shortcut(&updated_app);
                     }
@@ -299,12 +302,14 @@ fn save_app(
 
     // Check if updating or adding
     let icon_path = fetch_favicon(&url, &id);
+    let existing_notifications = existing_idx.and_then(|idx| apps[idx].notifications.clone());
 
     let mut app = PwaApp {
         id: id.clone(),
         name: name.trim().to_string(),
         url: url.trim().to_string(),
         icon: icon_path,
+        notifications: existing_notifications,
     };
 
     if let Some(idx) = existing_idx {
@@ -335,6 +340,22 @@ fn save_app(
         app.icon = icon_to_data_url(path).or_else(|| app.icon.clone());
     }
     Ok(app)
+}
+
+#[tauri::command]
+fn set_app_notification_permission(id: String, permission: String) -> Result<(), String> {
+    let mut apps = read_apps()?;
+    if let Some(app) = apps.iter_mut().find(|a| a.id == id) {
+        app.notifications = if permission == "default" {
+            None
+        } else {
+            Some(permission)
+        };
+        write_apps(&apps)?;
+        Ok(())
+    } else {
+        Err("App not found".to_string())
+    }
 }
 
 #[tauri::command]
@@ -440,6 +461,32 @@ pub fn open_pwa_window(app_handle: &AppHandle, app: &PwaApp) -> Result<(), Strin
 
     let shortcut_script = r#"
     (function() {
+      // 0. Safe Storage with memory fallback (protects against SecurityError on about:blank or restricted origins)
+      const memStore = {};
+      const safeStorage = {
+        getItem: function(k) {
+          try {
+            if (window.localStorage) {
+              const val = window.localStorage.getItem(k);
+              if (val !== null) return val;
+            }
+          } catch (e) {}
+          return Object.prototype.hasOwnProperty.call(memStore, k) ? memStore[k] : null;
+        },
+        setItem: function(k, v) {
+          try {
+            if (window.localStorage) window.localStorage.setItem(k, v);
+          } catch (e) {}
+          memStore[k] = String(v);
+        },
+        removeItem: function(k) {
+          try {
+            if (window.localStorage) window.localStorage.removeItem(k);
+          } catch (e) {}
+          delete memStore[k];
+        }
+      };
+
       // 1. Mock PWA Standalone environment for all web applications
       try {
         Object.defineProperty(Navigator.prototype, 'standalone', {
@@ -458,10 +505,7 @@ pub fn open_pwa_window(app_handle: &AppHandle, app: &PwaApp) -> Result<(), Strin
       } catch (e) {}
 
       window.__WARP_LAUNCHER__ = true;
-
-      try {
-        localStorage.setItem('isInstalled', 'true');
-      } catch (e) {}
+      safeStorage.setItem('isInstalled', 'true');
 
       try {
         const origMatchMedia = window.matchMedia;
@@ -496,14 +540,49 @@ pub fn open_pwa_window(app_handle: &AppHandle, app: &PwaApp) -> Result<(), Strin
         window.matchMedia = mockMatchMedia;
       } catch (e) {}
 
+      // 1.5. Audio & Media Autoplay Enhancements
+      try {
+        const unlockAudio = function() {
+          try {
+            const AudioContextClass = window.AudioContext || window.webkitAudioContext;
+            if (AudioContextClass) {
+              if (!window.__warp_audio_ctx) {
+                window.__warp_audio_ctx = new AudioContextClass();
+              }
+              if (window.__warp_audio_ctx.state === 'suspended') {
+                window.__warp_audio_ctx.resume();
+              }
+            }
+          } catch (e) {}
+        };
+        window.addEventListener('click', unlockAudio, { capture: true, passive: true });
+        window.addEventListener('keydown', unlockAudio, { capture: true, passive: true });
+        window.addEventListener('pointerdown', unlockAudio, { capture: true, passive: true });
+
+        const origMediaPlay = HTMLMediaElement.prototype.play;
+        HTMLMediaElement.prototype.play = function() {
+          try {
+            if (this.ended) {
+              this.currentTime = 0;
+            }
+            if (this.readyState === 0 && this.preload === 'none') {
+              this.load();
+            }
+          } catch (e) {}
+          return origMediaPlay.apply(this, arguments);
+        };
+      } catch (e) {}
+
       // 2. Restore saved zoom level
-      let currentZoom = parseFloat(localStorage.getItem('__warp_zoom') || '1.0');
+      let currentZoom = parseFloat(safeStorage.getItem('__warp_zoom') || '1.0');
       if (currentZoom !== 1.0) {
-        document.documentElement.style.zoom = currentZoom;
+        try {
+          document.documentElement.style.zoom = currentZoom;
+        } catch (e) {}
       }
 
       // 3. Window Title Customization (Persistent)
-      let customTitle = localStorage.getItem('__warp_custom_title') || '';
+      let customTitle = safeStorage.getItem('__warp_custom_title') || '';
       let currentTitleVal = document.title;
 
       try {
@@ -532,7 +611,7 @@ pub fn open_pwa_window(app_handle: &AppHandle, app: &PwaApp) -> Result<(), Strin
       } catch (e) {}
 
       if (customTitle) {
-        document.title = customTitle;
+        try { document.title = customTitle; } catch (e) {}
       }
 
       function showTitleDialog() {
@@ -585,11 +664,11 @@ pub fn open_pwa_window(app_handle: &AppHandle, app: &PwaApp) -> Result<(), Strin
           const val = input.value.trim();
           if (val) {
             customTitle = val;
-            localStorage.setItem('__warp_custom_title', val);
+            safeStorage.setItem('__warp_custom_title', val);
             document.title = val;
           } else {
             customTitle = '';
-            localStorage.removeItem('__warp_custom_title');
+            safeStorage.removeItem('__warp_custom_title');
             document.title = currentTitleVal || '';
           }
           close();
@@ -619,7 +698,7 @@ pub fn open_pwa_window(app_handle: &AppHandle, app: &PwaApp) -> Result<(), Strin
         box.appendChild(hint);
         box.appendChild(btnRow);
         overlay.appendChild(box);
-        document.body.appendChild(overlay);
+        (document.body || document.documentElement).appendChild(overlay);
 
         input.focus();
         input.select();
@@ -696,17 +775,510 @@ pub fn open_pwa_window(app_handle: &AppHandle, app: &PwaApp) -> Result<(), Strin
           if (ev.target === overlay) close();
         };
 
+        const permBtn = document.createElement('button');
+        permBtn.type = 'button';
+        permBtn.innerText = '🔔 Permissions (F8)';
+        permBtn.style.cssText = 'padding:8px 14px;border-radius:6px;border:1px solid #475569;background:transparent;color:#93c5fd;cursor:pointer;font-size:13px;font-weight:500;margin-right:auto;';
+        permBtn.onclick = function() {
+          close();
+          showPermissionsDialog();
+        };
+
+        btnRow.appendChild(permBtn);
         btnRow.appendChild(cancelBtn);
         btnRow.appendChild(goBtn);
         box.appendChild(label);
         box.appendChild(input);
         box.appendChild(btnRow);
         overlay.appendChild(box);
-        document.body.appendChild(overlay);
+        (document.body || document.documentElement).appendChild(overlay);
 
         input.focus();
         input.select();
       }
+
+      // 5. Desktop Notifications & Site Permissions
+      const activePermissionStatuses = [];
+
+      function getWarpPermission() {
+        const saved = safeStorage.getItem('__warp_notification_permission');
+        if (saved === 'granted' || saved === 'denied' || saved === 'default') {
+          return saved;
+        }
+        return window.__WARP_INITIAL_NOTIF_PERM__ || 'default';
+      }
+
+      function notifyPermissionChanged(newPerm) {
+        const newState = (newPerm === 'granted') ? 'granted' : ((newPerm === 'denied') ? 'denied' : 'prompt');
+        for (let i = 0; i < activePermissionStatuses.length; i++) {
+          const s = activePermissionStatuses[i];
+          s.state = newState;
+          s.status = newState;
+          if (typeof s.onchange === 'function') {
+            try { s.onchange(new Event('change')); } catch (e) {}
+          }
+          try { s.dispatchEvent(new Event('change')); } catch (e) {}
+        }
+      }
+
+      // Intercept Permissions API: navigator.permissions.query
+      try {
+        if (!navigator.permissions) {
+          try {
+            Object.defineProperty(navigator, 'permissions', {
+              value: {},
+              writable: true,
+              configurable: true
+            });
+          } catch (e) {}
+        }
+        if (navigator.permissions) {
+          const origQuery = (typeof navigator.permissions.query === 'function') ? navigator.permissions.query.bind(navigator.permissions) : null;
+          navigator.permissions.query = function(desc) {
+            if (desc && (desc.name === 'notifications' || desc.name === 'push')) {
+              const perm = getWarpPermission();
+              const state = (perm === 'granted') ? 'granted' : ((perm === 'denied') ? 'denied' : 'prompt');
+              const target = new EventTarget();
+              const statusObj = Object.assign(target, {
+                state: state,
+                status: state,
+                name: desc.name,
+                onchange: null
+              });
+              activePermissionStatuses.push(statusObj);
+              return Promise.resolve(statusObj);
+            }
+            if (origQuery) return origQuery(desc);
+            return Promise.reject(new TypeError("Failed to execute 'query' on 'Permissions': The provided value '" + (desc && desc.name) + "' is not a valid enum value of type PermissionName."));
+          };
+        }
+      } catch (e) {}
+
+      function showNotificationToast(title, options) {
+        options = options || {};
+        let container = document.getElementById('__warp_toast_container');
+        if (!container) {
+          container = document.createElement('div');
+          container.id = '__warp_toast_container';
+          container.style.cssText = 'position:fixed;bottom:24px;right:24px;z-index:2147483647;display:flex;flex-direction:column;gap:12px;max-width:380px;pointer-events:none;font-family:-apple-system,BlinkMacSystemFont,Segoe UI,Roboto,sans-serif;';
+          (document.body || document.documentElement).appendChild(container);
+        }
+
+        const toast = document.createElement('div');
+        toast.style.cssText = 'pointer-events:auto;background:#1e293b;color:#f8fafc;padding:14px 16px;border-radius:10px;box-shadow:0 12px 28px rgba(0,0,0,0.45);border:1px solid #3b82f6;display:flex;gap:12px;align-items:flex-start;';
+
+        const iconEl = document.createElement('div');
+        if (options.icon) {
+          const img = document.createElement('img');
+          img.src = options.icon;
+          img.style.cssText = 'width:32px;height:32px;border-radius:6px;object-fit:contain;';
+          iconEl.appendChild(img);
+        } else {
+          iconEl.innerText = '🔔';
+          iconEl.style.cssText = 'font-size:22px;line-height:1;';
+        }
+
+        const bodyEl = document.createElement('div');
+        bodyEl.style.cssText = 'flex:1;min-width:0;';
+
+        const titleDiv = document.createElement('div');
+        titleDiv.innerText = title || 'Notification';
+        titleDiv.style.cssText = 'font-weight:600;font-size:14px;color:#f8fafc;margin-bottom:4px;word-break:break-word;';
+
+        const descDiv = document.createElement('div');
+        descDiv.innerText = options.body || '';
+        descDiv.style.cssText = 'font-size:13px;color:#cbd5e1;line-height:1.4;word-break:break-word;';
+
+        bodyEl.appendChild(titleDiv);
+        if (options.body) bodyEl.appendChild(descDiv);
+
+        const closeBtn = document.createElement('button');
+        closeBtn.type = 'button';
+        closeBtn.innerText = '✕';
+        closeBtn.style.cssText = 'background:transparent;border:none;color:#94a3b8;cursor:pointer;font-size:14px;padding:0;line-height:1;margin-left:4px;';
+
+        function removeToast() {
+          toast.style.opacity = '0';
+          toast.style.transform = 'translateY(8px)';
+          toast.style.transition = 'opacity 0.2s ease, transform 0.2s ease';
+          setTimeout(() => {
+            if (toast.parentNode) toast.parentNode.removeChild(toast);
+          }, 200);
+        }
+
+        closeBtn.onclick = function(e) {
+          e.stopPropagation();
+          removeToast();
+        };
+
+        toast.onclick = function() {
+          window.focus();
+          removeToast();
+        };
+
+        toast.appendChild(iconEl);
+        toast.appendChild(bodyEl);
+        toast.appendChild(closeBtn);
+        container.appendChild(toast);
+
+        setTimeout(removeToast, 6000);
+      }
+
+      function showPermissionsDialog() {
+        if (document.getElementById('__warp_perms_dialog')) {
+          return;
+        }
+
+        const overlay = document.createElement('div');
+        overlay.id = '__warp_perms_dialog';
+        overlay.style.cssText = 'position:fixed;top:0;left:0;width:100vw;height:100vh;background:rgba(0,0,0,0.65);z-index:2147483647;display:flex;align-items:center;justify-content:center;font-family:-apple-system,BlinkMacSystemFont,Segoe UI,Roboto,sans-serif;';
+
+        const box = document.createElement('div');
+        box.style.cssText = 'background:#1e293b;color:#f8fafc;padding:24px;border-radius:12px;box-shadow:0 20px 25px -5px rgba(0,0,0,0.5);width:90%;max-width:520px;border:1px solid #334155;';
+
+        const title = document.createElement('h3');
+        title.innerText = 'Site Permissions: ' + (window.location.hostname || 'Current Site');
+        title.style.cssText = 'margin:0 0 16px 0;font-size:16px;font-weight:600;color:#f8fafc;display:flex;align-items:center;gap:8px;';
+
+        const row = document.createElement('div');
+        row.style.cssText = 'background:#0f172a;border:1px solid #334155;border-radius:8px;padding:14px 16px;margin-bottom:16px;';
+
+        const statusRow = document.createElement('div');
+        statusRow.style.cssText = 'display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;';
+
+        const permLabel = document.createElement('span');
+        permLabel.innerText = '🔔 Desktop Notifications';
+        permLabel.style.cssText = 'font-weight:600;font-size:14px;color:#e2e8f0;';
+
+        const statusBadge = document.createElement('span');
+        function updateBadge() {
+          const state = getWarpPermission();
+          if (state === 'granted') {
+            statusBadge.innerText = 'Allowed';
+            statusBadge.style.cssText = 'background:#166534;color:#86efac;padding:3px 10px;border-radius:6px;font-size:12px;font-weight:600;';
+          } else if (state === 'denied') {
+            statusBadge.innerText = 'Blocked';
+            statusBadge.style.cssText = 'background:#991b1b;color:#fca5a5;padding:3px 10px;border-radius:6px;font-size:12px;font-weight:600;';
+          } else {
+            statusBadge.innerText = 'Ask (Default)';
+            statusBadge.style.cssText = 'background:#334155;color:#94a3b8;padding:3px 10px;border-radius:6px;font-size:12px;font-weight:600;';
+          }
+        }
+        updateBadge();
+
+        statusRow.appendChild(permLabel);
+        statusRow.appendChild(statusBadge);
+
+        const hint = document.createElement('p');
+        hint.innerText = 'Allows or blocks web and push notifications for this isolated application profile.';
+        hint.style.cssText = 'font-size:12px;color:#94a3b8;margin:0 0 12px 0;line-height:1.4;';
+
+        const btnGroup = document.createElement('div');
+        btnGroup.style.cssText = 'display:flex;gap:8px;flex-wrap:wrap;';
+
+        const allowBtn = document.createElement('button');
+        allowBtn.type = 'button';
+        allowBtn.innerText = '✓ Allow';
+        allowBtn.style.cssText = 'padding:6px 12px;border-radius:6px;border:none;background:#22c55e;color:#ffffff;cursor:pointer;font-size:12px;font-weight:600;';
+        allowBtn.onclick = function() {
+          safeStorage.setItem('__warp_notification_permission', 'granted');
+          notifyPermissionChanged('granted');
+          updateBadge();
+        };
+
+        const blockBtn = document.createElement('button');
+        blockBtn.type = 'button';
+        blockBtn.innerText = '✕ Block';
+        blockBtn.style.cssText = 'padding:6px 12px;border-radius:6px;border:none;background:#ef4444;color:#ffffff;cursor:pointer;font-size:12px;font-weight:600;';
+        blockBtn.onclick = function() {
+          safeStorage.setItem('__warp_notification_permission', 'denied');
+          notifyPermissionChanged('denied');
+          updateBadge();
+        };
+
+        const resetBtn = document.createElement('button');
+        resetBtn.type = 'button';
+        resetBtn.innerText = '↺ Reset (Ask)';
+        resetBtn.style.cssText = 'padding:6px 12px;border-radius:6px;border:1px solid #475569;background:transparent;color:#94a3b8;cursor:pointer;font-size:12px;font-weight:500;';
+        resetBtn.onclick = function() {
+          safeStorage.setItem('__warp_notification_permission', 'default');
+          notifyPermissionChanged('default');
+          updateBadge();
+        };
+
+        const resetReloadBtn = document.createElement('button');
+        resetReloadBtn.type = 'button';
+        resetReloadBtn.innerText = '↺ Reset & Reload (F5)';
+        resetReloadBtn.style.cssText = 'padding:6px 12px;border-radius:6px;border:1px solid #3b82f6;background:rgba(59,130,246,0.15);color:#93c5fd;cursor:pointer;font-size:12px;font-weight:500;';
+        resetReloadBtn.onclick = function() {
+          safeStorage.setItem('__warp_notification_permission', 'default');
+          notifyPermissionChanged('default');
+          window.location.reload();
+        };
+
+        btnGroup.appendChild(allowBtn);
+        btnGroup.appendChild(blockBtn);
+        btnGroup.appendChild(resetBtn);
+        btnGroup.appendChild(resetReloadBtn);
+
+        row.appendChild(statusRow);
+        row.appendChild(hint);
+        row.appendChild(btnGroup);
+
+        const footerRow = document.createElement('div');
+        footerRow.style.cssText = 'display:flex;justify-content:flex-end;margin-top:20px;';
+
+        const closeBtn = document.createElement('button');
+        closeBtn.type = 'button';
+        closeBtn.innerText = 'Done';
+        closeBtn.style.cssText = 'padding:8px 20px;border-radius:6px;border:none;background:#3b82f6;color:#ffffff;cursor:pointer;font-size:13px;font-weight:600;';
+
+        function close() {
+          if (overlay.parentNode) overlay.parentNode.removeChild(overlay);
+        }
+
+        closeBtn.onclick = close;
+        overlay.onclick = function(e) {
+          if (e.target === overlay) close();
+        };
+
+        box.onkeydown = function(e) {
+          if (e.key === 'Escape') {
+            e.preventDefault();
+            close();
+          }
+        };
+
+        footerRow.appendChild(closeBtn);
+        box.appendChild(title);
+        box.appendChild(row);
+        box.appendChild(footerRow);
+        overlay.appendChild(box);
+        (document.body || document.documentElement).appendChild(overlay);
+        closeBtn.focus();
+      }
+
+      function handleRequestPermission(callback) {
+        const perm = getWarpPermission();
+        if (perm === 'denied') {
+          if (typeof callback === 'function') {
+            try { callback('denied'); } catch (e) {}
+          }
+          return Promise.resolve('denied');
+        }
+
+        // Auto approve immediately
+        safeStorage.setItem('__warp_notification_permission', 'granted');
+        notifyPermissionChanged('granted');
+        if (typeof callback === 'function') {
+          try { callback('granted'); } catch (e) {}
+        }
+        return Promise.resolve('granted');
+      }
+
+      try {
+        const OrigNotification = window.Notification;
+        function WarpNotification(title, options) {
+          if (!(this instanceof WarpNotification)) {
+            throw new TypeError("Failed to construct 'Notification': Please use the 'new' operator.");
+          }
+          let instance;
+          try {
+            instance = new OrigNotification(title, options);
+          } catch (e) {
+            instance = this;
+            instance.title = title;
+            instance.options = options || {};
+          }
+          const perm = getWarpPermission();
+          if (perm === 'granted') {
+            showNotificationToast(title, options);
+          }
+          return instance;
+        }
+
+        WarpNotification.prototype = OrigNotification ? OrigNotification.prototype : {};
+        Object.defineProperty(WarpNotification, 'permission', {
+          get: getWarpPermission,
+          configurable: true,
+          enumerable: true
+        });
+        WarpNotification.requestPermission = handleRequestPermission;
+        if (OrigNotification && OrigNotification.maxActions) {
+          WarpNotification.maxActions = OrigNotification.maxActions;
+        }
+
+        if (OrigNotification) {
+          try {
+            Object.defineProperty(OrigNotification, 'permission', {
+              get: getWarpPermission,
+              configurable: true,
+              enumerable: true
+            });
+          } catch (e) {}
+          OrigNotification.requestPermission = handleRequestPermission;
+        }
+
+        window.Notification = WarpNotification;
+        try {
+          Notification = WarpNotification;
+        } catch (e) {}
+      } catch (e) {}
+
+      // ServiceWorker Push & Notification Interception
+      function createMockSubscription(options) {
+        const p256dh = new Uint8Array([4, 15, 34, 52, 90, 12, 45, 67, 89, 100, 111, 122, 133, 144, 155, 166]);
+        const auth = new Uint8Array([23, 45, 67, 89, 12, 34, 56, 78, 90, 11, 22, 33, 44, 55, 66, 77]);
+        return {
+          endpoint: 'https://warp.local/push/' + Math.random().toString(36).substring(2),
+          expirationTime: null,
+          options: options || {},
+          getKey: function(name) {
+            if (name === 'p256dh') return p256dh.buffer;
+            if (name === 'auth') return auth.buffer;
+            return null;
+          },
+          toJSON: function() {
+            return {
+              endpoint: this.endpoint,
+              expirationTime: null,
+              keys: {
+                p256dh: 'BA8vIlJadAxDR1ljZW9yeYVqug==',
+                auth: 'F01HVwwyVn5aCyIzRFV2cw=='
+              }
+            };
+          },
+          unsubscribe: function() {
+            return Promise.resolve(true);
+          }
+        };
+      }
+
+      function MockPushManager() {}
+      MockPushManager.prototype.subscribe = function(options) {
+        const perm = getWarpPermission();
+        if (perm === 'denied') {
+          return Promise.reject(new DOMException('Registration failed - permission denied', 'NotAllowedError'));
+        }
+        safeStorage.setItem('__warp_notification_permission', 'granted');
+        notifyPermissionChanged('granted');
+        return Promise.resolve(createMockSubscription(options));
+      };
+      MockPushManager.prototype.getSubscription = function() {
+        const perm = getWarpPermission();
+        if (perm === 'granted') {
+          return Promise.resolve(createMockSubscription());
+        }
+        return Promise.resolve(null);
+      };
+      MockPushManager.prototype.permissionState = function() {
+        const perm = getWarpPermission();
+        return Promise.resolve((perm === 'granted') ? 'granted' : ((perm === 'denied') ? 'denied' : 'prompt'));
+      };
+
+      try {
+        window.PushManager = MockPushManager;
+      } catch (e) {}
+
+      function patchRegistration(reg) {
+        if (!reg) return;
+        try {
+          if (!reg.pushManager) {
+            reg.pushManager = new MockPushManager();
+          }
+        } catch (e) {}
+        try {
+          if (!reg.showNotification) {
+            reg.showNotification = function(title, options) {
+              const perm = getWarpPermission();
+              if (perm === 'granted') {
+                showNotificationToast(title, options);
+                return Promise.resolve();
+              }
+              return Promise.reject(new DOMException('Notification permission denied', 'NotAllowedError'));
+            };
+          }
+        } catch (e) {}
+      }
+
+      try {
+        if (typeof ServiceWorkerRegistration !== 'undefined' && ServiceWorkerRegistration.prototype) {
+          try {
+            Object.defineProperty(ServiceWorkerRegistration.prototype, 'pushManager', {
+              get: function() {
+                if (!this.__warp_pushManager) {
+                  this.__warp_pushManager = new MockPushManager();
+                }
+                return this.__warp_pushManager;
+              },
+              configurable: true,
+              enumerable: true
+            });
+          } catch (e) {
+            ServiceWorkerRegistration.prototype.pushManager = new MockPushManager();
+          }
+
+          ServiceWorkerRegistration.prototype.showNotification = function(title, options) {
+            const perm = getWarpPermission();
+            if (perm === 'granted') {
+              showNotificationToast(title, options);
+              return Promise.resolve();
+            }
+            return Promise.reject(new DOMException('Notification permission denied', 'NotAllowedError'));
+          };
+        }
+      } catch (e) {}
+
+      try {
+        if (navigator.serviceWorker) {
+          const origReady = navigator.serviceWorker.ready;
+          if (origReady) {
+            try {
+              Object.defineProperty(navigator.serviceWorker, 'ready', {
+                get: function() {
+                  return origReady.then(function(reg) {
+                    patchRegistration(reg);
+                    return reg;
+                  });
+                },
+                configurable: true
+              });
+            } catch (e) {}
+          }
+
+          const origRegister = navigator.serviceWorker.register;
+          if (origRegister) {
+            navigator.serviceWorker.register = function() {
+              return origRegister.apply(this, arguments).then(function(reg) {
+                patchRegistration(reg);
+                return reg;
+              });
+            };
+          }
+
+          const origGetReg = navigator.serviceWorker.getRegistration;
+          if (origGetReg) {
+            navigator.serviceWorker.getRegistration = function() {
+              return origGetReg.apply(this, arguments).then(function(reg) {
+                patchRegistration(reg);
+                return reg;
+              });
+            };
+          }
+
+          const origGetRegs = navigator.serviceWorker.getRegistrations;
+          if (origGetRegs) {
+            navigator.serviceWorker.getRegistrations = function() {
+              return origGetRegs.apply(this, arguments).then(function(regs) {
+                if (Array.isArray(regs)) {
+                  regs.forEach(patchRegistration);
+                }
+                return regs;
+              });
+            };
+          }
+        }
+      } catch (e) {}
 
       window.addEventListener('keydown', function(e) {
         // F5 or Ctrl+R: Reload
@@ -723,6 +1295,13 @@ pub fn open_pwa_window(app_handle: &AppHandle, app: &PwaApp) -> Result<(), Strin
           return;
         }
 
+        // F8 : Open Site Permissions dialog
+        if (e.key === 'F8') {
+          e.preventDefault();
+          showPermissionsDialog();
+          return;
+        }
+
         // Ctrl + L or F6 : Open URL dialog
         if (((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'l') || e.key === 'F6') {
           e.preventDefault();
@@ -734,8 +1313,8 @@ pub fn open_pwa_window(app_handle: &AppHandle, app: &PwaApp) -> Result<(), Strin
         if ((e.ctrlKey || e.metaKey) && (e.key === '+' || e.key === '=')) {
           e.preventDefault();
           currentZoom = Math.min(currentZoom + 0.1, 3.0);
-          document.documentElement.style.zoom = currentZoom;
-          localStorage.setItem('__warp_zoom', currentZoom.toString());
+          try { document.documentElement.style.zoom = currentZoom; } catch (e) {}
+          safeStorage.setItem('__warp_zoom', currentZoom.toString());
           return;
         }
 
@@ -743,8 +1322,8 @@ pub fn open_pwa_window(app_handle: &AppHandle, app: &PwaApp) -> Result<(), Strin
         if ((e.ctrlKey || e.metaKey) && (e.key === '-' || e.key === '_')) {
           e.preventDefault();
           currentZoom = Math.max(currentZoom - 0.1, 0.4);
-          document.documentElement.style.zoom = currentZoom;
-          localStorage.setItem('__warp_zoom', currentZoom.toString());
+          try { document.documentElement.style.zoom = currentZoom; } catch (e) {}
+          safeStorage.setItem('__warp_zoom', currentZoom.toString());
           return;
         }
 
@@ -752,8 +1331,8 @@ pub fn open_pwa_window(app_handle: &AppHandle, app: &PwaApp) -> Result<(), Strin
         if ((e.ctrlKey || e.metaKey) && e.key === '0') {
           e.preventDefault();
           currentZoom = 1.0;
-          document.documentElement.style.zoom = '1.0';
-          localStorage.removeItem('__warp_zoom');
+          try { document.documentElement.style.zoom = '1.0'; } catch (e) {}
+          safeStorage.removeItem('__warp_zoom');
           return;
         }
 
@@ -774,6 +1353,17 @@ pub fn open_pwa_window(app_handle: &AppHandle, app: &PwaApp) -> Result<(), Strin
     })();
     "#;
 
+    let initial_notif_perm = app.notifications.as_deref().unwrap_or("default");
+    let script_init = format!(
+        r#"
+        (function() {{
+            window.__WARP_INITIAL_NOTIF_PERM__ = "{}";
+        }})();
+        "#,
+        initial_notif_perm
+    );
+    let final_script = format!("{}\n{}", script_init, shortcut_script);
+
     let base_host = parsed_url.host_str().map(|h| h.to_lowercase());
     let nav_base_host = base_host.clone();
     let new_win_base_host = base_host.clone();
@@ -786,7 +1376,16 @@ pub fn open_pwa_window(app_handle: &AppHandle, app: &PwaApp) -> Result<(), Strin
     .title(&app.name)
     .inner_size(1200.0, 800.0)
     .data_directory(profile_dir)
-    .initialization_script(shortcut_script)
+    .initialization_script(&final_script)
+    .on_permission_request(move |_webview, kind| {
+        match kind {
+            tauri::webview::PermissionKind::Notifications
+            | tauri::webview::PermissionKind::Autoplay => {
+                tauri::webview::PermissionResponse::Allow
+            }
+            _ => tauri::webview::PermissionResponse::Default,
+        }
+    })
     .on_document_title_changed(|window, title| {
         let _ = window.set_title(&title);
     })
@@ -806,8 +1405,23 @@ pub fn open_pwa_window(app_handle: &AppHandle, app: &PwaApp) -> Result<(), Strin
         }
     });
 
-    builder.build().map_err(|e| e.to_string())?;
+    let win = builder.build().map_err(|e| e.to_string())?;
+
+    #[cfg(target_os = "linux")]
+    {
+        use webkit2gtk::{SettingsExt, WebViewExt};
+        let _ = win.with_webview(|webview| {
+            if let Some(settings) = webview.inner().settings() {
+                settings.set_media_playback_requires_user_gesture(false);
+                settings.set_media_playback_allows_inline(true);
+                settings.set_enable_webaudio(true);
+                settings.set_enable_media(true);
+            }
+        });
+    }
+
     Ok(())
+
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -854,7 +1468,8 @@ pub fn run() {
             delete_app,
             launch_app,
             create_desktop_shortcut,
-            reorder_apps
+            reorder_apps,
+            set_app_notification_permission
         ])
         .run(tauri::generate_context!())
         .expect("error while building tauri application");

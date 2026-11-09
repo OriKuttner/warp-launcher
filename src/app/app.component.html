@@ -62,6 +62,9 @@
             <span class="profile-tag">Profile: {{ app.id }}</span>
           </div>
           <footer class="card-actions" (click)="$event.stopPropagation()">
+            <button type="button" class="btn btn-sm btn-secondary perm-btn" [title]="'Notifications: ' + getPermissionLabel(app.notifications)" (click)="openPermissionsModal(app, $event)">
+              🔔 {{ getPermissionLabel(app.notifications) }}
+            </button>
             <button type="button" class="btn btn-sm btn-secondary" title="Create desktop shortcut" (click)="createShortcut(app, $event)">
               📌 Shortcut
             </button>
@@ -154,4 +157,52 @@
       </div>
     </form>
   </div>
+</dialog>
+
+<!-- Dialog for App Permissions -->
+<dialog #permissionsDialog class="app-dialog" aria-labelledby="perm-dialog-title">
+  @if (selectedAppForPerms(); as selectedApp) {
+    <div class="dialog-content">
+      <h2 id="perm-dialog-title">Site Permissions: {{ selectedApp.name }}</h2>
+
+      <div class="perm-section">
+        <div class="perm-header">
+          <span class="perm-title">🔔 Desktop Notifications</span>
+          <span class="perm-badge" [class.badge-granted]="selectedApp.notifications === 'granted'" [class.badge-denied]="selectedApp.notifications === 'denied'">
+            {{ getPermissionLabel(selectedApp.notifications) }}
+          </span>
+        </div>
+        <p class="field-hint">
+          Control whether this application is permitted to display browser and desktop notifications.
+        </p>
+
+        <div class="perm-choice-buttons">
+          <button type="button" class="btn btn-sm"
+            [class.btn-primary]="selectedApp.notifications === 'granted'"
+            [class.btn-secondary]="selectedApp.notifications !== 'granted'"
+            (click)="setAppPermission(selectedApp, 'granted')">
+            ✓ Allow
+          </button>
+          <button type="button" class="btn btn-sm"
+            [class.btn-danger]="selectedApp.notifications === 'denied'"
+            [class.btn-secondary]="selectedApp.notifications !== 'denied'"
+            (click)="setAppPermission(selectedApp, 'denied')">
+            ✕ Block
+          </button>
+          <button type="button" class="btn btn-sm"
+            [class.btn-primary]="!selectedApp.notifications || selectedApp.notifications === 'default'"
+            [class.btn-secondary]="selectedApp.notifications && selectedApp.notifications !== 'default'"
+            (click)="setAppPermission(selectedApp, 'default')">
+            ↺ Ask (Default)
+          </button>
+        </div>
+      </div>
+
+      <div class="dialog-actions">
+        <button type="button" class="btn btn-secondary" (click)="closePermissionsModal()">
+          Close
+        </button>
+      </div>
+    </div>
+  }
 </dialog>
