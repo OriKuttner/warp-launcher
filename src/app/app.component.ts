@@ -20,6 +20,7 @@ export interface PwaApp {
 })
 export class AppComponent implements OnInit {
   apps = signal<PwaApp[]>([]);
+  activeAppIds = signal<string[]>([]);
   isLoading = signal<boolean>(true);
   isSubmitting = signal<boolean>(false);
   message = signal<string>('');
@@ -34,6 +35,19 @@ export class AppComponent implements OnInit {
 
   ngOnInit(): void {
     this.loadApps();
+    this.loadActiveApps();
+    window.addEventListener('focus', () => {
+      this.loadActiveApps();
+    });
+  }
+
+  async loadActiveApps(): Promise<void> {
+    try {
+      const active = await invoke<string[]>('get_active_app_ids');
+      this.activeAppIds.set(active);
+    } catch (err) {
+      console.error('Failed to get active apps:', err);
+    }
   }
 
   async loadApps(): Promise<void> {
@@ -263,9 +277,24 @@ export class AppComponent implements OnInit {
     }
     try {
       await invoke('launch_app', { id: app.id });
+      await this.loadActiveApps();
     } catch (err) {
       console.error('Failed to launch app:', err);
       alert(`Error launching app: ${err}`);
+    }
+  }
+
+  async closeApp(app: PwaApp, event: Event): Promise<void> {
+    event.stopPropagation();
+    if (confirm(`Are you sure you want to stop and close "${app.name}" completely?`)) {
+      try {
+        await invoke('close_app', { id: app.id });
+        await this.loadActiveApps();
+        this.showTemporaryMessage(`Application "${app.name}" stopped.`);
+      } catch (err) {
+        console.error('Failed to close app:', err);
+        alert(`Error stopping app: ${err}`);
+      }
     }
   }
 

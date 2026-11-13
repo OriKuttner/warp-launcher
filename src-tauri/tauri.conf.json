@@ -1,7 +1,7 @@
 {
   "$schema": "../node_modules/@tauri-apps/cli/config.schema.json",
   "productName": "warp",
-  "version": "0.2.5",
+  "version": "0.2.9",
   "identifier": "com.warp.launcher",
   "build": {
     "frontendDist": "../dist/warp-ui/browser",
@@ -14,6 +14,7 @@
       {
         "label": "main",
         "title": "Warp Launcher",
+        "url": "index.html",
         "width": 960,
         "height": 680,
         "resizable": true,

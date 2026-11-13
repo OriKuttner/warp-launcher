@@ -1,7 +1,12 @@
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::PathBuf;
-use tauri::{webview::NewWindowResponse, AppHandle, Manager, WebviewUrl, WebviewWindowBuilder};
+use tauri::{
+    menu::{MenuBuilder, MenuItemBuilder},
+    tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
+    webview::NewWindowResponse,
+    AppHandle, Manager, WebviewUrl, WebviewWindowBuilder,
+};
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct PwaApp {
@@ -404,6 +409,27 @@ fn create_desktop_shortcut(id: String) -> Result<String, String> {
     write_desktop_shortcut(&app)
 }
 
+#[tauri::command]
+fn get_active_app_ids(app_handle: AppHandle) -> Vec<String> {
+    let mut active = Vec::new();
+    for (label, _) in app_handle.webview_windows() {
+        if let Some(app_id) = label.strip_prefix("pwa-") {
+            active.push(app_id.to_string());
+        }
+    }
+    active
+}
+
+#[tauri::command]
+fn close_app(app_handle: AppHandle, id: String) -> Result<(), String> {
+    let window_label = format!("pwa-{}", id);
+    if let Some(win) = app_handle.get_webview_window(&window_label) {
+        win.destroy().map_err(|e| e.to_string())?;
+        update_tray_menu(&app_handle);
+    }
+    Ok(())
+}
+
 fn open_in_default_browser(url: &str) {
     #[cfg(target_os = "linux")]
     {
@@ -550,7 +576,7 @@ pub fn open_pwa_window(app_handle: &AppHandle, app: &PwaApp) -> Result<(), Strin
                 window.__warp_audio_ctx = new AudioContextClass();
               }
               if (window.__warp_audio_ctx.state === 'suspended') {
-                window.__warp_audio_ctx.resume();
+                window.__warp_audio_ctx.resume().catch(function() {});
               }
             }
           } catch (e) {}
@@ -558,18 +584,75 @@ pub fn open_pwa_window(app_handle: &AppHandle, app: &PwaApp) -> Result<(), Strin
         window.addEventListener('click', unlockAudio, { capture: true, passive: true });
         window.addEventListener('keydown', unlockAudio, { capture: true, passive: true });
         window.addEventListener('pointerdown', unlockAudio, { capture: true, passive: true });
+        window.addEventListener('focus', unlockAudio, { passive: true });
+        window.addEventListener('DOMContentLoaded', unlockAudio, { passive: true });
+        unlockAudio();
+
+        // Prevent redundant seeks when setting currentTime to near 0 (fixes GStreamer seek race condition)
+        try {
+          const ctDesc = Object.getOwnPropertyDescriptor(HTMLMediaElement.prototype, 'currentTime');
+          if (ctDesc && ctDesc.set) {
+            const origSetCurrentTime = ctDesc.set;
+            Object.defineProperty(HTMLMediaElement.prototype, 'currentTime', {
+              get: function() { return ctDesc.get.call(this); },
+              set: function(val) {
+                if (Math.abs(this.currentTime - val) < 0.05) {
+                  return;
+                }
+                origSetCurrentTime.call(this, val);
+              },
+              configurable: true,
+              enumerable: true
+            });
+          }
+        } catch (e) {}
 
         const origMediaPlay = HTMLMediaElement.prototype.play;
         HTMLMediaElement.prototype.play = function() {
           try {
-            if (this.ended) {
+            if (this.ended && this.currentTime !== 0) {
               this.currentTime = 0;
             }
             if (this.readyState === 0 && this.preload === 'none') {
               this.load();
             }
           } catch (e) {}
-          return origMediaPlay.apply(this, arguments);
+
+          // If the element has already ended or is actively seeking from a currentTime reset,
+          // play via cloneNode to eliminate GStreamer seek latency/freeze on Linux
+          if (this.ended || this.seeking) {
+            try {
+              const clone = this.cloneNode(true);
+              clone.currentTime = 0;
+              return origMediaPlay.apply(clone, arguments);
+            } catch (e) {}
+          }
+
+          const p = origMediaPlay.apply(this, arguments);
+          if (p && typeof p.catch === 'function') {
+            return p.catch((err) => {
+              if (err && (err.name === 'AbortError' || err.name === 'NotAllowedError')) {
+                try {
+                  const clone = this.cloneNode(true);
+                  clone.currentTime = 0;
+                  return origMediaPlay.apply(clone, arguments);
+                } catch (e) {
+                  return new Promise((resolve, reject) => {
+                    const retry = () => {
+                      origMediaPlay.apply(this, []).then(resolve).catch(reject);
+                    };
+                    if (this.seeking) {
+                      this.addEventListener('seeked', retry, { once: true });
+                    } else {
+                      setTimeout(retry, 50);
+                    }
+                  });
+                }
+              }
+              return Promise.reject(err);
+            });
+          }
+          return p;
         };
       } catch (e) {}
 
@@ -856,6 +939,17 @@ pub fn open_pwa_window(app_handle: &AppHandle, app: &PwaApp) -> Result<(), Strin
 
       function showNotificationToast(title, options) {
         options = options || {};
+        try {
+          const originalTitle = document.title;
+          const notifSignal = '__WARP_NOTIF__:' + (title || 'Notification') + '::' + (options.body || '');
+          document.title = notifSignal;
+          setTimeout(function() {
+            if (document.title === notifSignal) {
+              document.title = originalTitle;
+            }
+          }, 50);
+        } catch (e) {}
+
         let container = document.getElementById('__warp_toast_container');
         if (!container) {
           container = document.createElement('div');
@@ -1280,6 +1374,49 @@ pub fn open_pwa_window(app_handle: &AppHandle, app: &PwaApp) -> Result<(), Strin
         }
       } catch (e) {}
 
+      function isRtlElement(el) {
+        if (!el) return false;
+        try {
+          const dirAttr = (el.getAttribute && el.getAttribute('dir') || '').toLowerCase();
+          if (dirAttr === 'rtl') return true;
+          if (dirAttr === 'ltr') return false;
+          const computed = window.getComputedStyle(el);
+          return !!(computed && computed.direction === 'rtl');
+        } catch (e) {
+          return false;
+        }
+      }
+
+      function getDeepActiveElement() {
+        let el = document.activeElement;
+        while (el) {
+          if (el.shadowRoot && el.shadowRoot.activeElement) {
+            el = el.shadowRoot.activeElement;
+          } else if (el.contentDocument && el.contentDocument.activeElement) {
+            el = el.contentDocument.activeElement;
+          } else {
+            break;
+          }
+        }
+        return el;
+      }
+
+      function getWordDistance(text, pos, direction) {
+        if (direction > 0) {
+          if (pos >= text.length) return 0;
+          let i = pos;
+          while (i < text.length && /\s/.test(text[i])) i++;
+          while (i < text.length && !/\s/.test(text[i])) i++;
+          return Math.max(1, i - pos);
+        } else {
+          if (pos <= 0) return 0;
+          let i = pos;
+          while (i > 0 && /\s/.test(text[i - 1])) i--;
+          while (i > 0 && !/\s/.test(text[i - 1])) i--;
+          return Math.max(1, pos - i);
+        }
+      }
+
       window.addEventListener('keydown', function(e) {
         // F5 or Ctrl+R: Reload
         if (e.key === 'F5' || ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'r')) {
@@ -1349,6 +1486,64 @@ pub fn open_pwa_window(app_handle: &AppHandle, app: &PwaApp) -> Result<(), Strin
           window.history.forward();
           return;
         }
+
+        // Fix WebKitGTK RTL text selection bug (Shift + ArrowLeft / ArrowRight)
+        if (e.shiftKey && !e.altKey && (e.key === 'ArrowLeft' || e.key === 'ArrowRight')) {
+          try {
+            const target = getDeepActiveElement();
+            if (target && isRtlElement(target)) {
+              if (target.tagName === 'TEXTAREA' || (target.tagName === 'INPUT' && typeof target.selectionStart === 'number')) {
+                e.preventDefault();
+                e.stopPropagation();
+
+                const start = target.selectionStart;
+                const end = target.selectionEnd;
+                const dir = target.selectionDirection || 'forward';
+
+                const anchor = (dir === 'backward') ? end : start;
+                const active = (dir === 'backward') ? start : end;
+
+                let delta = 0;
+                if (e.key === 'ArrowRight') {
+                  delta = e.ctrlKey ? -getWordDistance(target.value, active, -1) : -1;
+                } else if (e.key === 'ArrowLeft') {
+                  delta = e.ctrlKey ? getWordDistance(target.value, active, 1) : 1;
+                }
+
+                const newActive = Math.max(0, Math.min(target.value.length, active + delta));
+
+                let newStart, newEnd, newDir;
+                if (newActive < anchor) {
+                  newStart = newActive;
+                  newEnd = anchor;
+                  newDir = 'backward';
+                } else if (newActive > anchor) {
+                  newStart = anchor;
+                  newEnd = newActive;
+                  newDir = 'forward';
+                } else {
+                  newStart = newActive;
+                  newEnd = newActive;
+                  newDir = 'forward';
+                }
+
+                target.setSelectionRange(newStart, newEnd, newDir);
+                try {
+                  document.dispatchEvent(new Event('selectionchange'));
+                } catch (_) {}
+                return;
+              } else if (target.isContentEditable || (window.getSelection && window.getSelection().rangeCount > 0)) {
+                const sel = window.getSelection();
+                if (sel && typeof sel.modify === 'function') {
+                  e.preventDefault();
+                  e.stopPropagation();
+                  sel.modify('extend', e.key === 'ArrowLeft' ? 'left' : 'right', e.ctrlKey ? 'word' : 'character');
+                  return;
+                }
+              }
+            }
+          } catch (err) {}
+        }
       }, true);
     })();
     "#;
@@ -1373,6 +1568,7 @@ pub fn open_pwa_window(app_handle: &AppHandle, app: &PwaApp) -> Result<(), Strin
         &window_label,
         WebviewUrl::External(parsed_url),
     )
+    .devtools(true)
     .title(&app.name)
     .inner_size(1200.0, 800.0)
     .data_directory(profile_dir)
@@ -1387,6 +1583,21 @@ pub fn open_pwa_window(app_handle: &AppHandle, app: &PwaApp) -> Result<(), Strin
         }
     })
     .on_document_title_changed(|window, title| {
+        if let Some(payload) = title.strip_prefix("__WARP_NOTIF__:") {
+            let mut parts = payload.splitn(2, "::");
+            let notif_title = parts.next().unwrap_or("Notification");
+            let notif_body = parts.next().unwrap_or("");
+            #[cfg(target_os = "linux")]
+            {
+                let _ = std::process::Command::new("notify-send")
+                    .arg("-a")
+                    .arg("Warp")
+                    .arg(notif_title)
+                    .arg(notif_body)
+                    .spawn();
+            }
+            return;
+        }
         let _ = window.set_title(&title);
     })
     .on_navigation(move |nav_url| {
@@ -1412,6 +1623,7 @@ pub fn open_pwa_window(app_handle: &AppHandle, app: &PwaApp) -> Result<(), Strin
         use webkit2gtk::{SettingsExt, WebViewExt};
         let _ = win.with_webview(|webview| {
             if let Some(settings) = webview.inner().settings() {
+                settings.set_enable_developer_extras(true);
                 settings.set_media_playback_requires_user_gesture(false);
                 settings.set_media_playback_allows_inline(true);
                 settings.set_enable_webaudio(true);
@@ -1420,8 +1632,52 @@ pub fn open_pwa_window(app_handle: &AppHandle, app: &PwaApp) -> Result<(), Strin
         });
     }
 
+    update_tray_menu(app_handle);
+
     Ok(())
 
+}
+
+pub fn update_tray_menu(app_handle: &AppHandle) {
+    let tray = match app_handle.tray_by_id("main-tray") {
+        Some(t) => t,
+        None => return,
+    };
+
+    let show_launcher_item = match MenuItemBuilder::with_id("show_launcher", "Open Warp Launcher").build(app_handle) {
+        Ok(i) => i,
+        Err(_) => return,
+    };
+    let quit_item = match MenuItemBuilder::with_id("quit", "Quit Warp").build(app_handle) {
+        Ok(i) => i,
+        Err(_) => return,
+    };
+
+    let mut menu_builder = MenuBuilder::new(app_handle)
+        .item(&show_launcher_item)
+        .separator();
+
+    let apps = read_apps().unwrap_or_default();
+    let windows = app_handle.webview_windows();
+    let mut has_active = false;
+
+    for pwa in &apps {
+        let win_label = format!("pwa-{}", pwa.id);
+        if windows.contains_key(&win_label) {
+            has_active = true;
+            if let Ok(app_item) = MenuItemBuilder::with_id(format!("app:{}", pwa.id), format!("🟢 {}", pwa.name)).build(app_handle) {
+                menu_builder = menu_builder.item(&app_item);
+            }
+        }
+    }
+
+    if has_active {
+        menu_builder = menu_builder.separator();
+    }
+
+    if let Ok(tray_menu) = menu_builder.item(&quit_item).build() {
+        let _ = tray.set_menu(Some(tray_menu));
+    }
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -1435,6 +1691,58 @@ pub fn run() {
                         .build(),
                 )?;
             }
+
+            // Setup Tray Icon
+            let show_launcher_item = MenuItemBuilder::with_id("show_launcher", "Open Warp Launcher").build(app)?;
+            let quit_item = MenuItemBuilder::with_id("quit", "Quit Warp").build(app)?;
+            let tray_menu = MenuBuilder::new(app)
+                .item(&show_launcher_item)
+                .separator()
+                .item(&quit_item)
+                .build()?;
+
+            let mut tray_builder = TrayIconBuilder::with_id("main-tray")
+                .menu(&tray_menu)
+                .show_menu_on_left_click(false);
+
+            if let Some(icon) = app.default_window_icon() {
+                tray_builder = tray_builder.icon(icon.clone());
+            }
+
+            tray_builder
+                .on_tray_icon_event(|tray, event| {
+                    if let TrayIconEvent::Click {
+                        button: MouseButton::Left,
+                        button_state: MouseButtonState::Up,
+                        ..
+                    } = event {
+                        let app_handle = tray.app_handle();
+                        if let Some(main_win) = app_handle.get_webview_window("main") {
+                            let _ = main_win.show();
+                            let _ = main_win.set_focus();
+                        }
+                    }
+                })
+                .on_menu_event(|app_handle, event| {
+                    let id_str = event.id.as_ref();
+                    if id_str == "show_launcher" {
+                        if let Some(main_win) = app_handle.get_webview_window("main") {
+                            let _ = main_win.show();
+                            let _ = main_win.set_focus();
+                        }
+                    } else if id_str == "quit" {
+                        app_handle.exit(0);
+                    } else if let Some(app_id) = id_str.strip_prefix("app:") {
+                        let window_label = format!("pwa-{}", app_id);
+                        if let Some(win) = app_handle.get_webview_window(&window_label) {
+                            let _ = win.show();
+                            let _ = win.set_focus();
+                        }
+                    }
+                })
+                .build(app)?;
+
+            update_tray_menu(app.handle());
 
             // CLI arguments parsing for direct PWA launch: e.g. warp --app <folder_id>
             let args: Vec<String> = std::env::args().collect();
@@ -1453,14 +1761,22 @@ pub fn run() {
                 let apps = read_apps().unwrap_or_default();
                 if let Some(target_app) = apps.into_iter().find(|a| a.id == app_id) {
                     let _ = open_pwa_window(app.handle(), &target_app);
-                    // Close the default launcher window if opened
+                    // Hide the default launcher window if opened directly with --app
                     if let Some(main_win) = app.get_webview_window("main") {
-                        let _ = main_win.close();
+                        let _ = main_win.hide();
                     }
                 }
             }
 
             Ok(())
+        })
+        .on_window_event(|window, event| {
+            if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+                let _ = window.hide();
+                api.prevent_close();
+            } else if let tauri::WindowEvent::Destroyed = event {
+                update_tray_menu(window.app_handle());
+            }
         })
         .invoke_handler(tauri::generate_handler![
             get_apps,
@@ -1469,7 +1785,9 @@ pub fn run() {
             launch_app,
             create_desktop_shortcut,
             reorder_apps,
-            set_app_notification_permission
+            set_app_notification_permission,
+            get_active_app_ids,
+            close_app
         ])
         .run(tauri::generate_context!())
         .expect("error while building tauri application");

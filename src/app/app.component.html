@@ -57,11 +57,21 @@
             }
           </div>
           <div class="card-details">
-            <h3>{{ app.name }}</h3>
+            <div class="card-title-row">
+              <h3>{{ app.name }}</h3>
+              @if (activeAppIds().includes(app.id)) {
+                <span class="active-badge" title="Running in background">● Running</span>
+              }
+            </div>
             <p class="app-url">{{ app.url }}</p>
             <span class="profile-tag">Profile: {{ app.id }}</span>
           </div>
           <footer class="card-actions" (click)="$event.stopPropagation()">
+            @if (activeAppIds().includes(app.id)) {
+              <button type="button" class="btn btn-sm btn-danger stop-btn" title="Completely stop application" (click)="closeApp(app, $event)">
+                ⏹️ Stop
+              </button>
+            }
             <button type="button" class="btn btn-sm btn-secondary perm-btn" [title]="'Notifications: ' + getPermissionLabel(app.notifications)" (click)="openPermissionsModal(app, $event)">
               🔔 {{ getPermissionLabel(app.notifications) }}
             </button>
